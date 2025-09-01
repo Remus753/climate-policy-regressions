@@ -1,0 +1,18 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# macOS
+.DS_Store
+
+# Results (optional — ignore generated CSVs if you don’t want to track them)
+# Results/
+
+# Cache
+_cache/
+*_cache/
+
+# VSCode
+.vscode/
