@@ -184,7 +184,7 @@ write.csv(with_outcome_lower_df,
 
 message("Saved controls VIF and Excel-style correlation matrices.")
 
-# --- Policy regressions ---
+# --- Policy regressions (lag-2 effects ONLY) ---
 stopifnot(dir_exists(policies_dir))
 policy_files <- dir_ls(policies_dir, glob = "*.csv")
 if (length(policy_files) == 0) stop("No policy CSVs found in the Policies folder: ", policies_dir)
@@ -220,7 +220,8 @@ for (i in seq_along(policy_files_kept)) {
     mutate(policy_var_lag2 = lag(policy_var, 2)) |>
     ungroup()
   
-  fit <- lm(ln_co2_pc_norm ~ policy_var + policy_var_lag2 +
+  # CHANGED: only include lag-2 policy variable in the model (no contemporaneous term)
+  fit <- lm(ln_co2_pc_norm ~ policy_var_lag2 +
               ln_gdp_pc_norm + ln_pop_norm + fossil_pct_norm + carbon_pricing_dummy,
             data = df)
   
@@ -238,10 +239,11 @@ results_tbl <- bind_rows(all_results)
 summary_tbl <- bind_rows(all_glance) |>
   select(policy_code, policy_name, category, r.squared, adj.r.squared, sigma, AIC, BIC, N)
 
+# CHANGED: keep only the lag-2 effect rows
 policy_effects <- results_tbl |>
-  filter(term %in% c("policy_var","policy_var_lag2")) |>
+  filter(term %in% c("policy_var_lag2")) |>
   mutate(
-    effect     = if_else(term == "policy_var", "contemporaneous", "lag2"),
+    effect     = "lag2",
     estimate   = estimate,
     std_error  = std.error,
     statistic  = statistic,
@@ -250,43 +252,39 @@ policy_effects <- results_tbl |>
   select(policy_code, policy_name, category, effect, term, estimate, std_error, statistic, p_value) |>
   left_join(summary_tbl, by = c("policy_code","policy_name","category"))
 
+# CHANGED: ranks computed for lag2 only
 policy_effects_ranked <- policy_effects |>
-  group_by(effect) |>
   mutate(
     rank_all = min_rank(estimate),
     rank_sig = if_else(p_value < 0.05, min_rank(estimate), NA_integer_)
   ) |>
-  ungroup() |>
-  group_by(category, effect) |>
+  group_by(category) |>
   mutate(
     rank_cat_all = min_rank(estimate),
     rank_cat_sig = if_else(p_value < 0.05, min_rank(estimate), NA_integer_)
   ) |>
   ungroup() |>
-  arrange(effect, estimate, policy_code)
+  arrange(estimate, policy_code)
 
+# Optional: preserve ordering helper (kept for consistency)
 policy_levels <- c("z", build_two_letter_seq("aa","dq"))
 comparison_table <- policy_effects |>
   mutate(policy_code = factor(policy_code, levels = policy_levels)) |>
-  arrange(policy_code, effect)
+  arrange(policy_code)  # CHANGED: no "effect" sort since only lag2 remains
 
-# Save regression outputs
+# --- Save outputs (lag-2 only) ---
 write_csv(results_tbl,      file.path(output_dir, "policy_regression_full_coefs.csv"))
 write_csv(summary_tbl,      file.path(output_dir, "policy_regression_model_summaries.csv"))
-write_csv(comparison_table, file.path(output_dir, "policy_regression_comparison_table.csv"))
-write_csv(policy_effects_ranked, file.path(output_dir, "policy_ranks_all.csv"))
-write_csv(filter(policy_effects_ranked, effect == "contemporaneous"),
-          file.path(output_dir, "policy_ranks_contemporaneous.csv"))
-write_csv(filter(policy_effects_ranked, effect == "lag2"),
-          file.path(output_dir, "policy_ranks_lag2.csv"))
+write_csv(comparison_table, file.path(output_dir, "policy_regression_lag2_only_table.csv"))  # CHANGED: renamed
+write_csv(policy_effects_ranked, file.path(output_dir, "policy_ranks_lag2.csv"))
 
-message("All outputs saved in ", output_dir)
+message("Lag-2 only outputs saved in ", output_dir)
 
-# Quick peek at top 10 contemporaneous (most negative coefficients first)
-policy_effects_ranked |>
-  filter(effect == "contemporaneous") |>
-  arrange(estimate) |>
-  slice_head(n = 10) |>
-  select(policy_code, policy_name, category, estimate, p_value,
-         rank_all, rank_sig, rank_cat_all, rank_cat_sig) |>
-  print(n = 10)
+# CHANGED: removed 'quick peek' for contemporaneous
+# If you want a quick peek at top 10 lag-2 (most negative coefficients first), uncomment:
+# policy_effects_ranked |>
+#   arrange(estimate) |>
+#   slice_head(n = 10) |>
+#   select(policy_code, policy_name, category, estimate, p_value,
+#          rank_all, rank_sig, rank_cat_all, rank_cat_sig) |>
+#   print(n = 10)
