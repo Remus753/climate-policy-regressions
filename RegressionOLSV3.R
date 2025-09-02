@@ -1,5 +1,5 @@
 # RegressionOLSV3.R
-# Run from the repository root. Requires: tidyverse, broom, readr, fs, here, stringr
+# Run from the repository root. Requires: tidyverse, broom, readr, fs, here, stringr, car
 
 if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
 
@@ -9,6 +9,7 @@ library(readr)
 library(fs)
 library(stringr)
 library(here)
+library(car)   # for VIFs
 
 # --- File paths (relative to repo root) ---
 base_dir     <- here::here("Datasets")
@@ -115,6 +116,75 @@ panel_base <- co2_long |>
   ) |>
   filter(year >= YEAR_START, year <= YEAR_END)
 
+if (!dir_exists(output_dir)) dir_create(output_dir)
+
+# --- Multicollinearity diagnostics for controls only ---
+fit_controls <- lm(
+  ln_co2_pc_norm ~ ln_gdp_pc_norm + ln_pop_norm + fossil_pct_norm + carbon_pricing_dummy,
+  data = panel_base
+)
+
+vif_vals <- car::vif(fit_controls)
+controls_vif_tbl <- tibble(
+  variable  = names(vif_vals),
+  vif       = as.numeric(vif_vals),
+  tolerance = 1 / as.numeric(vif_vals)
+)
+write_csv(controls_vif_tbl, file.path(output_dir, "controls_multicollinearity_vif.csv"))
+
+# Correlation matrices (Excel-style)
+controls_mat <- panel_base |>
+  select(ln_gdp_pc_norm, ln_pop_norm, fossil_pct_norm, carbon_pricing_dummy) |>
+  as.data.frame()
+controls_cor <- suppressWarnings(cor(controls_mat, use = "pairwise.complete.obs"))
+
+with_outcome_mat <- panel_base |>
+  select(ln_co2_pc_norm, ln_gdp_pc_norm, ln_pop_norm, fossil_pct_norm, carbon_pricing_dummy) |>
+  as.data.frame()
+controls_with_outcome_cor <- suppressWarnings(cor(with_outcome_mat, use = "pairwise.complete.obs"))
+
+round_to <- 3
+
+# Controls-only full
+controls_cor_df <- data.frame(var = rownames(controls_cor),
+                              round(controls_cor, round_to),
+                              check.names = FALSE)
+write.csv(controls_cor_df, file.path(output_dir, "controls_correlations_matrix.csv"),
+          row.names = FALSE, na = "")
+
+# Controls-only lower triangle
+controls_lower <- round(controls_cor, round_to)
+controls_lower[upper.tri(controls_lower, diag = FALSE)] <- NA
+controls_lower_df <- data.frame(var = rownames(controls_lower),
+                                controls_lower,
+                                check.names = FALSE)
+controls_lower_df[is.na(controls_lower_df)] <- ""
+write.csv(controls_lower_df,
+          file.path(output_dir, "controls_correlations_matrix_lowertriangle.csv"),
+          row.names = FALSE, na = "")
+
+# Controls + outcome full
+with_outcome_df <- data.frame(var = rownames(controls_with_outcome_cor),
+                              round(controls_with_outcome_cor, round_to),
+                              check.names = FALSE)
+write.csv(with_outcome_df,
+          file.path(output_dir, "controls_with_outcome_correlations_matrix.csv"),
+          row.names = FALSE, na = "")
+
+# Controls + outcome lower triangle
+with_outcome_lower <- round(controls_with_outcome_cor, round_to)
+with_outcome_lower[upper.tri(with_outcome_lower, diag = FALSE)] <- NA
+with_outcome_lower_df <- data.frame(var = rownames(with_outcome_lower),
+                                    with_outcome_lower,
+                                    check.names = FALSE)
+with_outcome_lower_df[is.na(with_outcome_lower_df)] <- ""
+write.csv(with_outcome_lower_df,
+          file.path(output_dir, "controls_with_outcome_correlations_matrix_lowertriangle.csv"),
+          row.names = FALSE, na = "")
+
+message("Saved controls VIF and Excel-style correlation matrices.")
+
+# --- Policy regressions ---
 stopifnot(dir_exists(policies_dir))
 policy_files <- dir_ls(policies_dir, glob = "*.csv")
 if (length(policy_files) == 0) stop("No policy CSVs found in the Policies folder: ", policies_dir)
@@ -150,7 +220,9 @@ for (i in seq_along(policy_files_kept)) {
     mutate(policy_var_lag2 = lag(policy_var, 2)) |>
     ungroup()
   
-  fit <- lm(ln_co2_pc_norm ~ policy_var + policy_var_lag2 + ln_gdp_pc_norm + ln_pop_norm + fossil_pct_norm + carbon_pricing_dummy, data = df)
+  fit <- lm(ln_co2_pc_norm ~ policy_var + policy_var_lag2 +
+              ln_gdp_pc_norm + ln_pop_norm + fossil_pct_norm + carbon_pricing_dummy,
+            data = df)
   
   tid <- tidy(fit) |>
     mutate(policy_code = var_code, policy_name = var_name, category = cat_name)
@@ -166,67 +238,55 @@ results_tbl <- bind_rows(all_results)
 summary_tbl <- bind_rows(all_glance) |>
   select(policy_code, policy_name, category, r.squared, adj.r.squared, sigma, AIC, BIC, N)
 
-policy_coefs <- results_tbl |>
+policy_effects <- results_tbl |>
   filter(term %in% c("policy_var","policy_var_lag2")) |>
-  transmute(
-    policy_code,
-    policy_name,
-    category,
-    term,
-    estimate,
-    std_error = std.error,
-    statistic,
-    p_value = p.value
-  )
+  mutate(
+    effect     = if_else(term == "policy_var", "contemporaneous", "lag2"),
+    estimate   = estimate,
+    std_error  = std.error,
+    statistic  = statistic,
+    p_value    = p.value
+  ) |>
+  select(policy_code, policy_name, category, effect, term, estimate, std_error, statistic, p_value) |>
+  left_join(summary_tbl, by = c("policy_code","policy_name","category"))
+
+policy_effects_ranked <- policy_effects |>
+  group_by(effect) |>
+  mutate(
+    rank_all = min_rank(estimate),
+    rank_sig = if_else(p_value < 0.05, min_rank(estimate), NA_integer_)
+  ) |>
+  ungroup() |>
+  group_by(category, effect) |>
+  mutate(
+    rank_cat_all = min_rank(estimate),
+    rank_cat_sig = if_else(p_value < 0.05, min_rank(estimate), NA_integer_)
+  ) |>
+  ungroup() |>
+  arrange(effect, estimate, policy_code)
 
 policy_levels <- c("z", build_two_letter_seq("aa","dq"))
-
-comparison_table <- policy_coefs |>
-  left_join(summary_tbl, by = c("policy_code","policy_name","category")) |>
+comparison_table <- policy_effects |>
   mutate(policy_code = factor(policy_code, levels = policy_levels)) |>
-  arrange(policy_code, term)
+  arrange(policy_code, effect)
 
-if (!dir_exists(output_dir)) dir_create(output_dir)
+# Save regression outputs
+write_csv(results_tbl,      file.path(output_dir, "policy_regression_full_coefs.csv"))
+write_csv(summary_tbl,      file.path(output_dir, "policy_regression_model_summaries.csv"))
+write_csv(comparison_table, file.path(output_dir, "policy_regression_comparison_table.csv"))
+write_csv(policy_effects_ranked, file.path(output_dir, "policy_ranks_all.csv"))
+write_csv(filter(policy_effects_ranked, effect == "contemporaneous"),
+          file.path(output_dir, "policy_ranks_contemporaneous.csv"))
+write_csv(filter(policy_effects_ranked, effect == "lag2"),
+          file.path(output_dir, "policy_ranks_lag2.csv"))
 
-policy_corr_list <- list()
-policy_corr_lag2_list <- list()
+message("All outputs saved in ", output_dir)
 
-for (i in seq_along(policy_files_kept)) {
-  pf <- policy_files_kept[i]
-  var_code <- policy_codes_kept[i]
-  var_name <- get_policy_name(var_code)
-  cat_name <- get_category(var_code)
-  
-  pol_long <- load_matrix_csv(pf, var_code) |>
-    mutate(!!var_code := as.integer(replace_na(.data[[var_code]], 0) != 0))
-  
-  df <- panel_base |>
-    left_join(pol_long, by = c("country","year")) |>
-    mutate(policy_var = as.integer(replace_na(.data[[var_code]], 0))) |>
-    group_by(country) |>
-    arrange(year, .by_group = TRUE) |>
-    mutate(policy_var_lag2 = lag(policy_var, 2)) |>
-    ungroup()
-  
-  n_now  <- sum(complete.cases(df$ln_co2_pc_norm, df$policy_var))
-  n_lag2 <- sum(complete.cases(df$ln_co2_pc_norm, df$policy_var_lag2))
-  
-  c_now  <- suppressWarnings(cor(df$ln_co2_pc_norm, df$policy_var, use = "complete.obs"))
-  c_lag2 <- suppressWarnings(cor(df$ln_co2_pc_norm, df$policy_var_lag2, use = "complete.obs"))
-  
-  policy_corr_list[[var_code]]    <- tibble(policy_code = var_code, policy_name = var_name, category = cat_name, correlation = c_now,  n_pairs = n_now)
-  policy_corr_lag2_list[[var_code]] <- tibble(policy_code = var_code, policy_name = var_name, category = cat_name, correlation = c_lag2, n_pairs = n_lag2)
-}
-
-policy_corr      <- bind_rows(policy_corr_list)      |> arrange(correlation, policy_code) |> mutate(rank = row_number())
-policy_corr_lag2 <- bind_rows(policy_corr_lag2_list) |> arrange(correlation, policy_code) |> mutate(rank = row_number())
-
-write_csv(results_tbl,        file.path(output_dir, "policy_regression_full_coefs.csv"))
-write_csv(summary_tbl,        file.path(output_dir, "policy_regression_model_summaries.csv"))
-write_csv(comparison_table,   file.path(output_dir, "policy_regression_comparison_table.csv"))
-write_csv(policy_corr,        file.path(output_dir, "policy_correlations_contemporaneous.csv"))
-write_csv(policy_corr_lag2,   file.path(output_dir, "policy_correlations_lag2.csv"))
-
-message("Saved: policy_regression_full_coefs.csv, policy_regression_model_summaries.csv, policy_regression_comparison_table.csv, policy_correlations_contemporaneous.csv, policy_correlations_lag2.csv in ", output_dir)
-
-comparison_table |> slice_head(n = 10) |> print(n = 10)
+# Quick peek at top 10 contemporaneous (most negative coefficients first)
+policy_effects_ranked |>
+  filter(effect == "contemporaneous") |>
+  arrange(estimate) |>
+  slice_head(n = 10) |>
+  select(policy_code, policy_name, category, estimate, p_value,
+         rank_all, rank_sig, rank_cat_all, rank_cat_sig) |>
+  print(n = 10)
