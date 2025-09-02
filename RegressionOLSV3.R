@@ -1,7 +1,12 @@
 # RegressionOLSV3.R
-# Run from the repository root. Requires: tidyverse, broom, readr, fs, here, stringr, car
+# Run from the repository root. Requires: tidyverse, broom, readr, fs, here, stringr, car, jsonlite
+# - Self-bootstraps CSVs from:
+#   https://github.com/Remus753/climate-policy-regressions/tree/main/Datasets
+#   https://github.com/Remus753/climate-policy-regressions/tree/main/Policies
+# - Only runs 2-year lagged effects (no contemporaneous policy terms)
 
 if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+if (!requireNamespace("jsonlite", quietly = TRUE)) install.packages("jsonlite")
 
 library(tidyverse)
 library(broom)
@@ -9,12 +14,14 @@ library(readr)
 library(fs)
 library(stringr)
 library(here)
-library(car)   # for VIFs
+library(car)        # for VIFs
+library(jsonlite)   # for GitHub Contents API
 
-# --- File paths (relative to repo root) ---
-base_dir     <- here::here("Datasets")
-policies_dir <- here::here("Policies")
-output_dir   <- here::here("Results")
+# --- Repo + paths ---
+GITHUB_REPO   <- "Remus753/climate-policy-regressions"
+base_dir      <- here::here("Datasets")
+policies_dir  <- here::here("Policies")
+output_dir    <- here::here("Results")
 
 COUNTRY_ROW_START <- 3
 COUNTRY_ROW_END   <- 38
@@ -30,7 +37,76 @@ paths <- list(
   climate_policy = file.path(base_dir, "Climate Policy EU-BRICS - Climate Policy.csv")
 )
 
-# --- Helpers ---
+# --- Utilities: bootstrap CSVs from GitHub if missing ---
+github_list_csvs <- function(repo, subdir) {
+  url <- paste0("https://api.github.com/repos/", repo, "/contents/", subdir)
+  resp <- tryCatch(jsonlite::fromJSON(url), error = function(e) NULL)
+  if (is.null(resp)) return(tibble())
+  as_tibble(resp) |>
+    filter(type == "file", grepl("\\.csv$", name, ignore.case = TRUE)) |>
+    transmute(name, download_url)
+}
+
+ensure_dir <- function(p) if (!dir_exists(p)) dir_create(p)
+
+download_if_missing <- function(url, dest) {
+  if (is.na(url) || is.na(dest) || url == "" || dest == "") return(invisible(FALSE))
+  if (!file_exists(dest)) {
+    message("Downloading: ", basename(dest))
+    try(download.file(url, destfile = dest, mode = "wb", quiet = TRUE), silent = TRUE)
+  }
+  file_exists(dest)
+}
+
+bootstrap_folder_from_github <- function(repo, subdir, dest_dir) {
+  ensure_dir(dest_dir)
+  listing <- github_list_csvs(repo, subdir)
+  if (nrow(listing) == 0) {
+    message("Warning: couldn't list ", subdir, " via API; will fall back to known files if provided.")
+  }
+  ok <- logical(0)
+  if (nrow(listing) > 0) {
+    ok <- vapply(seq_len(nrow(listing)), function(i) {
+      dest <- file.path(dest_dir, listing$name[i])
+      download_if_missing(listing$download_url[i], dest)
+    }, logical(1))
+  }
+  invisible(any(ok) || nrow(listing) > 0)
+}
+
+# Fallback helper to ensure specific files (for Datasets folder names used below)
+ensure_known_files <- function(repo, subdir, dest_dir, files) {
+  ensure_dir(dest_dir)
+  for (f in files) {
+    dest <- file.path(dest_dir, f)
+    if (!file_exists(dest)) {
+      url <- paste0("https://raw.githubusercontent.com/", repo, "/main/", subdir, "/", utils::URLencode(f))
+      download_if_missing(url, dest)
+    }
+  }
+}
+
+# --- Bootstrap data: Datasets + Policies ---
+ensure_dir(output_dir)
+
+# Datasets via API (and fallback to the 6 known filenames)
+bootstrap_folder_from_github(GITHUB_REPO, "Datasets", base_dir)
+ensure_known_files(
+  GITHUB_REPO, "Datasets", base_dir,
+  c(
+    "Climate National Indicators EU-BRICS - Carbon Pricing.csv",
+    "Climate National Indicators EU-BRICS - CO2 Emission Per Capita.csv",
+    "Climate National Indicators EU-BRICS - Fossil Fuel %.csv",
+    "Climate National Indicators EU-BRICS - GDP per Capita.csv",
+    "Climate National Indicators EU-BRICS - Population.csv",
+    "Climate Policy EU-BRICS - Climate Policy.csv"
+  )
+)
+
+# Policies via API (download all CSVs present)
+bootstrap_folder_from_github(GITHUB_REPO, "Policies", policies_dir)
+
+# --- Helpers for loading/labeling ---
 load_matrix_csv <- function(path, value_name) {
   stopifnot(file_exists(path))
   raw <- read_csv(path, col_names = FALSE, show_col_types = FALSE)
@@ -116,7 +192,8 @@ panel_base <- co2_long |>
   ) |>
   filter(year >= YEAR_START, year <= YEAR_END)
 
-if (!dir_exists(output_dir)) dir_create(output_dir)
+# Ensure outputs dir
+ensure_dir(output_dir)
 
 # --- Multicollinearity diagnostics for controls only ---
 fit_controls <- lm(
@@ -220,7 +297,7 @@ for (i in seq_along(policy_files_kept)) {
     mutate(policy_var_lag2 = lag(policy_var, 2)) |>
     ungroup()
   
-  # CHANGED: only include lag-2 policy variable in the model (no contemporaneous term)
+  # Lag-2 only
   fit <- lm(ln_co2_pc_norm ~ policy_var_lag2 +
               ln_gdp_pc_norm + ln_pop_norm + fossil_pct_norm + carbon_pricing_dummy,
             data = df)
@@ -239,7 +316,6 @@ results_tbl <- bind_rows(all_results)
 summary_tbl <- bind_rows(all_glance) |>
   select(policy_code, policy_name, category, r.squared, adj.r.squared, sigma, AIC, BIC, N)
 
-# CHANGED: keep only the lag-2 effect rows
 policy_effects <- results_tbl |>
   filter(term %in% c("policy_var_lag2")) |>
   mutate(
@@ -252,7 +328,6 @@ policy_effects <- results_tbl |>
   select(policy_code, policy_name, category, effect, term, estimate, std_error, statistic, p_value) |>
   left_join(summary_tbl, by = c("policy_code","policy_name","category"))
 
-# CHANGED: ranks computed for lag2 only
 policy_effects_ranked <- policy_effects |>
   mutate(
     rank_all = min_rank(estimate),
@@ -266,25 +341,15 @@ policy_effects_ranked <- policy_effects |>
   ungroup() |>
   arrange(estimate, policy_code)
 
-# Optional: preserve ordering helper (kept for consistency)
 policy_levels <- c("z", build_two_letter_seq("aa","dq"))
 comparison_table <- policy_effects |>
   mutate(policy_code = factor(policy_code, levels = policy_levels)) |>
-  arrange(policy_code)  # CHANGED: no "effect" sort since only lag2 remains
+  arrange(policy_code)
 
 # --- Save outputs (lag-2 only) ---
 write_csv(results_tbl,      file.path(output_dir, "policy_regression_full_coefs.csv"))
 write_csv(summary_tbl,      file.path(output_dir, "policy_regression_model_summaries.csv"))
-write_csv(comparison_table, file.path(output_dir, "policy_regression_lag2_only_table.csv"))  # CHANGED: renamed
+write_csv(comparison_table, file.path(output_dir, "policy_regression_lag2_only_table.csv"))
 write_csv(policy_effects_ranked, file.path(output_dir, "policy_ranks_lag2.csv"))
 
 message("Lag-2 only outputs saved in ", output_dir)
-
-# CHANGED: removed 'quick peek' for contemporaneous
-# If you want a quick peek at top 10 lag-2 (most negative coefficients first), uncomment:
-# policy_effects_ranked |>
-#   arrange(estimate) |>
-#   slice_head(n = 10) |>
-#   select(policy_code, policy_name, category, estimate, p_value,
-#          rank_all, rank_sig, rank_cat_all, rank_cat_sig) |>
-#   print(n = 10)
